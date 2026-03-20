@@ -1,3 +1,4 @@
+# pyright: reportPossiblyUnboundVariable=false, reportOptionalMemberAccess=false
 import os
 import json
 from alerts import AlertType, Severity

@@ -1,7 +1,10 @@
+# pyright: reportCallIssue=false, reportArgumentType=false, reportRedeclaration=false, reportAttributeAccessIssue=false
+
 import sys
 import os
 from pathlib import Path
 
+# ── Path setup (so imports work from any working directory) ────────────────────
 APP_DIR = Path(__file__).parent
 ROOT_DIR = APP_DIR.parent
 sys.path.insert(0, str(APP_DIR))
@@ -23,6 +26,10 @@ from inventory import (
 from forecasting import forecast_item, forecast_all, simulate_days_forward, set_sim_date
 from alerts import check_alerts, check_all_alerts, alert_badge_color, alert_emoji, AlertType, Severity
 from insights import generate_insight, generate_daily_brief, fallback_insight, ORG_CONTEXT, suggest_suppliers, generate_cross_org_tip, get_cross_org_scenario
+
+# ─────────────────────────────────────────────
+# PAGE CONFIG & GLOBAL STYLE
+# ─────────────────────────────────────────────
 
 st.set_page_config(
     page_title="EcoTrack AI",
@@ -216,6 +223,7 @@ hr { border-color: var(--border) !important; margin: 1rem 0 !important; }
 """, unsafe_allow_html=True)
 
 
+
 def init_state():
     if "inventory" not in st.session_state:
         st.session_state.inventory = load_inventory()
@@ -262,7 +270,7 @@ all_alerts = check_all_alerts(inv, forecasts)
 
 
 ORG_LABELS  = {"all": "All Orgs", "cafe": "☕ Café", "nonprofit": "🤝 Non-Profit", "university_lab": "🔬 University Lab"}
-TYPE_LABELS = {"all": "All Types", "perishable": "Perishable", "consumable": "Consumable", "non_expiry": "Non-Expiry"}
+TYPE_LABELS = {"all": "All Types", "perishable": "🥛 Perishable", "consumable": "📦 Consumable", "non_expiry": "🔧 Non-Expiry"}
 ORG_ICONS   = {"cafe": "☕", "nonprofit": "🤝", "university_lab": "🔬"}
 
 def sev_class(severity) -> str:
@@ -342,6 +350,7 @@ with st.sidebar:
             st.session_state.dev_mode = True
             st.rerun()
 
+    # Date label — always visible
     _date_color = "#fcd34d" if st.session_state.sim_active else "#4ade80"
     _date_prefix = "⏩ Simulated" if st.session_state.sim_active else "📅 Date"
     st.markdown(
@@ -430,18 +439,43 @@ with st.sidebar:
 
     else:
         # ── Live Mode: daily inventory update ────────────────────────────────
-        from datetime import datetime as _dt_live, date as _date_live
+        from datetime import datetime as _dt_live, date as _date_live, timedelta as _td_live
         st.markdown('<p class="et-label">Record Inventory Count</p>', unsafe_allow_html=True)
+
+        _ref_date_str = st.session_state.get("sim_current_date") or _dt_live.today().strftime("%Y-%m-%d")
+        _ref_date     = _dt_live.strptime(_ref_date_str, "%Y-%m-%d").date()
 
         record_date = st.date_input(
             "Count date",
-            value=_date_live.today(),
+            value=_dt_live.today().date(),
             key="live_record_date",
             label_visibility="collapsed",
-            help="The date these counts are recorded for (typically end of business day)",
+            help="Today or a future date only. Past dates cannot be recorded.",
         )
         record_date_str = record_date.strftime("%Y-%m-%d")
-        st.caption(f"Recording counts for {record_date_str}")
+
+        # ── Date validation feedback ──────────────────────────────────────────
+        _days_delta = (record_date - _ref_date).days
+
+        if _days_delta < 0:
+            # Past date — show warning, block save
+            st.error(
+                f"⛔ {record_date_str} is in the past (current date: {_ref_date_str}). "
+                f"Past inventory records cannot be changed."
+            )
+            _date_blocked = True
+        elif _days_delta == 0:
+            st.caption(f"Recording counts for today ({record_date_str})")
+            _date_blocked = False
+        else:
+            # Future date — inform user about gap-filling behaviour
+            st.info(
+                f"📅 Recording for {record_date_str} ({_days_delta} day(s) ahead). "
+                f"The {_days_delta} day(s) between {_ref_date_str} and {record_date_str} "
+                f"will be logged as zero-use days for changed items, and the current date "
+                f"will advance to {record_date_str}."
+            )
+            _date_blocked = False
 
         trackable_live = [i for i in inv if i["type"] != "non_expiry"]
         with st.expander(f"Update quantities ({len(trackable_live)} items)", expanded=False):
@@ -463,11 +497,24 @@ with st.sidebar:
                     live_updates[item["id"]] = new_val
 
         changed_count = len(live_updates)
-        btn_label = f"Save {changed_count} change(s) for {record_date_str}" if changed_count else "No changes"
+        btn_label = f"✓ Save {changed_count} change(s) for {record_date_str}" if changed_count else "No changes"
         if st.button(btn_label, type="primary", use_container_width=True,
-                     disabled=(changed_count == 0), key="live_save_btn"):
+                     disabled=(changed_count == 0 or _date_blocked), key="live_save_btn"):
             cur_inv, cur_hist = inv, hist
             errors_all = []
+
+            if _days_delta > 0:
+                for item_id in live_updates:
+                    for gap_day in range(1, _days_delta):
+                        gap_date = (_ref_date + _td_live(days=gap_day)).strftime("%Y-%m-%d")
+                        cur_hist = cur_hist + [{
+                            "item_id":       item_id,
+                            "date":          gap_date,
+                            "quantity_used": 0.0,
+                            "restock_qty":   0,
+                            "event":         "no_use",
+                        }]
+
             for item_id, new_qty in live_updates.items():
                 item_obj = next((i for i in cur_inv if i["id"] == item_id), None)
                 note = "restock" if item_obj and new_qty > item_obj["current_qty"] else "usage"
@@ -482,20 +529,28 @@ with st.sidebar:
             else:
                 st.session_state.inventory  = cur_inv
                 st.session_state.history    = cur_hist
+                # Advance the effective date to the recorded date
                 st.session_state.sim_current_date = record_date_str
                 set_sim_date(record_date_str)
                 get_forecasts.clear()
                 st.session_state.insight_cache = {}
                 save_inventory(cur_inv)
                 save_history(cur_hist)
-                st.success(f"✓ {changed_count} item(s) recorded for {record_date_str}")
+                if _days_delta > 0:
+                    st.success(
+                        f"✓ {changed_count} item(s) recorded for {record_date_str}. "
+                        f"{_days_delta} gap day(s) logged as zero-use. "
+                        f"Current date advanced to {record_date_str}."
+                    )
+                else:
+                    st.success(f"✓ {changed_count} item(s) recorded for {record_date_str}")
                 st.rerun()
 
     if st.session_state.sim_active:
         _trackable_all = [i for i in inv if i["type"] != "non_expiry"]
         n_overridden = len([i for i in _trackable_all
                             if st.session_state.get(f"sim_override_{i['id']}", 0) > 0])
-        label = f"{st.session_state.sim_days}d total simulated"
+        label = f"⏩ {st.session_state.sim_days}d total simulated"
         if n_overridden:
             label += f" · {n_overridden} override(s)"
         st.markdown(f'<div style="color:#fcd34d;font-size:0.72rem;margin-top:0.3rem">{label}</div>',
@@ -504,13 +559,18 @@ with st.sidebar:
 
     st.divider()
 
+    # API key status
     api_key = os.getenv("GROQ_API_KEY", "")
     if api_key:
         st.markdown('<p style="color:#4ade80;font-size:0.72rem">● AI insights active</p>', unsafe_allow_html=True)
     else:
         st.markdown('<p style="color:#fb923c;font-size:0.72rem">● Rule-based fallback mode</p>', unsafe_allow_html=True)
-        st.caption("Set ANTHROPIC_API_KEY in .env to enable LLM insights")
+        st.caption("Set GROQ_API_KEY in .env to enable LLM insights")
 
+
+# ─────────────────────────────────────────────
+# PAGE: DASHBOARD
+# ─────────────────────────────────────────────
 
 def page_dashboard():
     if st.session_state.sim_active:
@@ -518,6 +578,7 @@ def page_dashboard():
         sim_cur = st.session_state.get("sim_current_date", _dt_dash.today().strftime("%Y-%m-%d"))
         st.markdown(f'<div class="dev-mode-banner">⏩ Developer Mode — {st.session_state.sim_days} days simulated · Date: {sim_cur}</div>', unsafe_allow_html=True)
 
+    # ── Waste events from simulation ─────────────────────────────────────
     waste_evts = st.session_state.get("waste_events", [])
     if waste_evts:
         total_wasted_items = len(waste_evts)
@@ -536,6 +597,7 @@ def page_dashboard():
             )
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # Filter to selected org
     _of = st.session_state.get("org_filter", "all")
     disp_inv = inv if _of == "all" else [i for i in inv if i["org"] == _of]
     disp_forecasts = {i["id"]: forecasts.get(i["id"], {}) for i in disp_inv}
@@ -546,6 +608,7 @@ def page_dashboard():
     org_label = _org_labels.get(_of2, "All Orgs")
     st.markdown(f"<h1>Inventory Overview <span style='color:#6b7c76;font-size:1rem;font-weight:400'>{org_label}</span></h1>", unsafe_allow_html=True)
 
+    # ── Summary metrics ────────────────────────────────────────────────────────
     high_count    = sum(1 for a in disp_alerts if a.severity == Severity.HIGH)
     waste_count   = sum(1 for a in disp_alerts if a.type == AlertType.WASTE_RISK)
     stock_count   = sum(1 for a in disp_alerts if a.type == AlertType.STOCKOUT_RISK)
@@ -564,9 +627,10 @@ def page_dashboard():
 
     st.divider()
 
+    # ── Weekly Brief ──────────────────────────────────────────────────────────
     brief_org = st.session_state.get("org_filter", "cafe")
     if brief_org == "all":
-        brief_org = "cafe" 
+        brief_org = "cafe"  # fallback for "all orgs" view uses café as representative
     brief_key = f"brief_{brief_org}_{st.session_state.sim_days}"
 
     with st.expander("🧠 Daily Intelligence Brief", expanded=True):
@@ -597,10 +661,11 @@ def page_dashboard():
 
     st.divider()
 
+    # ── Alert cards ───────────────────────────────────────────────────────────
     high_med = [a for a in disp_alerts if a.severity in (Severity.HIGH, Severity.MEDIUM)]
     if high_med:
         st.markdown("<h2>Active Alerts</h2>", unsafe_allow_html=True)
-        for alert in high_med[:8]: 
+        for alert in high_med[:8]:  # cap at 8 for dashboard
             emoji = alert_emoji(alert.type)
             css   = sev_class(alert.severity)
             st.markdown(
@@ -613,7 +678,7 @@ def page_dashboard():
                 unsafe_allow_html=True,
             )
     else:
-        st.success("No critical alerts. Inventory looking healthy.")
+        st.success("✅ No critical alerts. Inventory looking healthy.")
 
     st.divider()
 
@@ -623,7 +688,7 @@ def page_dashboard():
     # Compute waste cost + items at risk
     _waste_cost   = 0.0
     _waste_items  = []
-    _saved_cost   = 0.0 
+    _saved_cost   = 0.0  # estimate: items restocked correctly (not over-ordered)
     for _item in disp_inv:
         _fc = disp_forecasts.get(_item["id"], {})
         _wu = _fc.get("estimated_waste_units") or 0
@@ -632,19 +697,19 @@ def page_dashboard():
             _wc = round(_wu * _cpu, 2)
             _waste_cost += _wc
             _waste_items.append((_item["name"], _wu, _item["unit"], _wc))
-            
+        # Items healthy (no waste, no stockout) = saved from over-ordering
         if not _fc.get("waste_risk") and not _fc.get("stockout_risk") and _item["type"] != "non_expiry":
             _saved_cost += _item.get("cost_per_unit", 0) * max(0, _item["current_qty"] * 0.05)
 
     _sus_c1, _sus_c2, _sus_c3 = st.columns(3)
-    _sus_c1.metric("Potential Waste Value",
+    _sus_c1.metric("♻️ Potential Waste Value",
                    f"₹{_waste_cost:.0f}" if _waste_cost else "₹0",
                    delta=f"{len(_waste_items)} item(s) at risk" if _waste_items else "No waste risk",
                    delta_color="inverse")
-    _sus_c2.metric("Items On Track",
+    _sus_c2.metric("✅ Items On Track",
                    f"{sum(1 for i in disp_inv if not disp_forecasts.get(i['id'],{}).get('waste_risk') and not disp_forecasts.get(i['id'],{}).get('stockout_risk') and i['type']!='non_expiry')}",
                    delta="healthy stock levels")
-    _sus_c3.metric("Tracked Items",
+    _sus_c3.metric("📦 Tracked Items",
                    len([i for i in disp_inv if i['type'] != 'non_expiry']),
                    delta=f"{len([i for i in disp_inv if i['type']=='perishable'])} perishables monitored")
 
@@ -669,9 +734,10 @@ def page_dashboard():
 
     st.divider()
 
-    # Quick inventory grid 
+    # ── Quick inventory grid ───────────────────────────────────────────────────
     st.markdown("<h2>Inventory at a Glance</h2>", unsafe_allow_html=True)
 
+    # Sort: items with alerts first
     def sort_key(item):
         fc  = forecasts.get(item["id"], {})
         als = check_alerts(item, fc)
@@ -746,10 +812,14 @@ def page_dashboard():
         st.caption(f"Showing 15 of {len(sorted_inv)} items. View all in Inventory tab.")
 
 
+# ─────────────────────────────────────────────
+# PAGE: INVENTORY (full table + detail)
+# ─────────────────────────────────────────────
 
 def page_inventory():
     st.markdown("<h1>Inventory</h1>", unsafe_allow_html=True)
 
+    # ── Search & filter bar ────────────────────────────────────────────────────
     fc1, fc2, fc3, fc4 = st.columns([3, 1.5, 1.5, 1.5])
     with fc1:
         query = st.text_input("🔍 Search items...", placeholder="name or category", label_visibility="collapsed")
@@ -773,6 +843,7 @@ def page_inventory():
         alert_filter=alert_filter, forecasts=forecasts,
     )
 
+    # Sort
     if sort_by == "alert":
         def _sort(item):
             als = check_alerts(item, forecasts.get(item["id"], {}))
@@ -788,6 +859,7 @@ def page_inventory():
     st.caption(f"{len(filtered)} item(s) shown")
     st.divider()
 
+    # ── Item list ──────────────────────────────────────────────────────────────
     for item in filtered:
         fc   = forecasts.get(item["id"], {})
         als  = check_alerts(item, fc)
@@ -821,6 +893,7 @@ def page_inventory():
                     unsafe_allow_html=True,
                 )
 
+                # Forecast details
                 st.markdown("---")
                 if item['type'] == 'non_expiry':
                     m1, m2 = st.columns(2)
@@ -837,12 +910,14 @@ def page_inventory():
                               conf.upper(),
                               delta=f"{fc.get('data_points_used',0)} data pts")
 
+                # Waste / stockout flags
                 if fc.get("waste_risk"):
                     wu = fc.get("estimated_waste_units", 0)
                     st.warning(f"♻️ Waste risk — ~{wu} {item['unit']} may expire unused")
                 if fc.get("stockout_risk"):
                     st.error(f"⚠️ Stockout risk — reorder {item.get('reorder_qty','')} {item['unit']} recommended")
 
+                # Active alerts list
                 if als:
                     st.markdown("**Alerts:**")
                     for alert in als:
@@ -850,6 +925,7 @@ def page_inventory():
                         col = {"high": "#f87171", "medium": "#fb923c", "low": "#60a5fa"}.get(str(alert.severity), "#a8b8b0")
                         st.markdown(f'<div style="color:{col};font-size:0.82rem;margin-bottom:0.2rem">{emoji} {alert.message}</div>', unsafe_allow_html=True)
 
+                # Model badge — skip for equipment
                 if item['type'] != 'non_expiry':
                     if fc.get("model_used") == "fallback":
                         st.markdown('<span class="ai-badge fallback">Rule-based fallback</span>', unsafe_allow_html=True)
@@ -860,10 +936,10 @@ def page_inventory():
 
                 st.markdown("---")
 
-                # AI Insight
+                # ── AI Insight (not shown for equipment) ──────────────────
                 if item['type'] != 'non_expiry':
                     insight_key = f"insight_{item['id']}_{st.session_state.sim_days}"
-                    if st.button(f"Generate AI Insight", key=f"gen_{item['id']}"):
+                    if st.button(f"🧠 Generate AI Insight", key=f"gen_{item['id']}"):
                         with st.spinner("Thinking..."):
                             result = generate_insight(item, fc, als)
                             st.session_state.insight_cache[insight_key] = result
@@ -929,13 +1005,14 @@ def page_inventory():
 
                 st.markdown("---")
 
+                # Discard button for expiring/expired items
                 exp_days_inv = fc.get("expiry_days_remaining")
                 if exp_days_inv is not None and exp_days_inv <= 1 and item["current_qty"] > 0:
                     avg_inv        = fc.get("avg_daily_usage", 0)
                     shelf_life_inv = item.get("shelf_life_days")
                     target         = min(14, shelf_life_inv - 1) if shelf_life_inv else 14
                     target_qty     = round(avg_inv * target, 1) if avg_inv > 0 else float(item.get("reorder_qty", 0))
-                    sug            = target_qty
+                    sug            = target_qty  # after discard on-hand = 0, order full target
                     sug_note       = (
                         f"Target: {target_qty} {item['unit']} (~{target}d stock). "
                         f"You have {item['current_qty']:.1f} {item['unit']} — "
@@ -976,7 +1053,9 @@ def page_inventory():
                         st.rerun()
 
 
+# ─────────────────────────────────────────────
 # PAGE: ADD ITEM
+# ─────────────────────────────────────────────
 
 def page_add_item():
     st.markdown("<h1>Add New Item</h1>", unsafe_allow_html=True)
@@ -986,44 +1065,55 @@ def page_add_item():
     col1, col2 = st.columns(2)
 
     with col1:
-        name     = st.text_input("Item Name *", placeholder="e.g. Whole Milk")
-        org      = st.selectbox("Organisation *", options=list(VALID_ORGS),
-                                format_func=lambda x: ORG_LABELS.get(x, x))
+        name      = st.text_input("Item Name *", placeholder="e.g. Whole Milk")
+        org       = st.selectbox("Organisation *", options=list(VALID_ORGS),
+                                 format_func=lambda x: ORG_LABELS.get(x, x))
         item_type = st.selectbox("Item Type *", options=list(VALID_TYPES),
                                  format_func=lambda x: TYPE_LABELS.get(x, x))
-        category = st.text_input("Category", placeholder="e.g. dairy, reagent, office_supply")
-        unit     = st.text_input("Unit *", placeholder="e.g. liters, kg, units, boxes")
+        category  = st.text_input("Category", placeholder="e.g. dairy, reagent, office_supply")
+        unit      = st.text_input("Unit *", placeholder="e.g. liters, kg, units, boxes")
 
     with col2:
-        current_qty     = st.number_input("Current Quantity *", min_value=0.0, step=1.0, value=10.0)
+        current_qty       = st.number_input("Current Quantity *", min_value=0.0, step=1.0, value=10.0)
         reorder_threshold = st.number_input("Reorder Threshold *", min_value=0.0, step=1.0, value=3.0,
-                                             help="Alert triggers below this quantity")
-        reorder_qty     = st.number_input("Reorder Quantity", min_value=0.0, step=1.0, value=0.0,
-                                          help="How much to order. Defaults to 3× threshold.")
-        cost_per_unit   = st.number_input("Cost per Unit (₹)", min_value=0.0, step=1.0, value=0.0)
+                                            help="Alert triggers below this quantity")
+        reorder_qty       = st.number_input("Reorder Quantity", min_value=0.0, step=1.0, value=0.0,
+                                            help="How much to order. Defaults to 3× threshold.")
+        cost_per_unit     = st.number_input("Cost per Unit (₹)", min_value=0.0, step=1.0, value=0.0)
 
         has_expiry = st.checkbox("Has expiry date?", value=(item_type == "perishable"))
-        expiry_date = None
+        expiry_date  = None
+        shelf_life   = None
         if has_expiry:
-            expiry_date = st.date_input("Expiry Date",
-                                        value=datetime.today() + timedelta(days=30),
-                                        min_value=datetime.today())
+            shelf_life = st.number_input(
+                "Shelf Life (days) *",
+                min_value=1, step=1, value=14,
+                help="How many days a fresh batch lasts from delivery. Used to recalculate expiry on every restock.",
+            )
+            # Default expiry date = today + shelf life so it stays consistent
+            expiry_date = st.date_input(
+                "Current Batch Expiry Date",
+                value=datetime.today() + timedelta(days=int(shelf_life)),
+                min_value=datetime.today(),
+                help="Expiry date of the stock you have right now. Future restocks will use Shelf Life to recalculate automatically.",
+            )
             expiry_date = expiry_date.strftime("%Y-%m-%d")
 
     st.divider()
 
     if st.button("＋ Add Item", type="primary"):
         data = {
-            "name": name,
-            "org": org,
-            "type": item_type,
-            "category": category or "general",
-            "unit": unit,
-            "current_qty": current_qty,
+            "name":             name,
+            "org":              org,
+            "type":             item_type,
+            "category":         category or "general",
+            "unit":             unit,
+            "current_qty":      current_qty,
             "reorder_threshold": reorder_threshold,
-            "reorder_qty": reorder_qty if reorder_qty > 0 else reorder_threshold * 3,
-            "cost_per_unit": cost_per_unit,
-            "expiry_date": expiry_date,
+            "reorder_qty":      reorder_qty if reorder_qty > 0 else reorder_threshold * 3,
+            "cost_per_unit":    cost_per_unit,
+            "expiry_date":      expiry_date,
+            "shelf_life_days":  int(shelf_life) if shelf_life else None,
         }
         updated_inv, errors = add_item(inv, data)
         if errors:
@@ -1038,7 +1128,9 @@ def page_add_item():
             st.rerun()
 
 
+# ─────────────────────────────────────────────
 # PAGE: ALERTS
+# ─────────────────────────────────────────────
 
 def page_alerts():
     st.markdown("<h1>Alerts</h1>", unsafe_allow_html=True)
@@ -1048,6 +1140,7 @@ def page_alerts():
     disp_fc  = {i["id"]: forecasts.get(i["id"], {}) for i in disp_inv}
     disp_als = check_all_alerts(disp_inv, disp_fc)
 
+    # Summary row
     by_sev = {s: [a for a in disp_als if a.severity == s] for s in Severity}
     c1, c2, c3 = st.columns(3)
     c1.metric("🚨 High",   len(by_sev[Severity.HIGH]))
@@ -1057,9 +1150,10 @@ def page_alerts():
     st.divider()
 
     if not disp_als:
-        st.success("No alerts for the selected filter. Inventory looks healthy.")
+        st.success("✅ No alerts for the selected filter. Inventory looks healthy.")
         return
 
+    # Group by alert type
     type_groups = {}
     for alert in disp_als:
         type_groups.setdefault(alert.type, []).append(alert)
@@ -1095,6 +1189,7 @@ def page_alerts():
                     exp_days   = fc.get("expiry_days_remaining")
                     unit       = item["unit"]
 
+                    # ── Restock suggestion (usage-based) ─────────────────────
                     shelf_life = item.get("shelf_life_days")
                     if item["type"] == "perishable" and shelf_life:
                         TARGET_DAYS_STOCK = min(14, shelf_life - 1)
@@ -1114,13 +1209,13 @@ def page_alerts():
                         suggested_order = float(item.get("reorder_qty", 0))
                         restock_note = None
 
+                    # ── Routing: discard only if stock remains AND expired/waste ──
                     already_out   = item["current_qty"] <= 0
                     is_expired    = (exp_days is not None and exp_days <= 0)
                     is_waste_risk = atype == AlertType.WASTE_RISK
                     show_discard  = (is_expired or is_waste_risk) and not already_out
 
                     if show_discard:
-                        # WASTE / EXPIRED with remaining stock 
                         waste_qty = item["current_qty"]
                         st.markdown(
                             f'<div class="et-card alert-high" style="margin-top:0.5rem">'
@@ -1157,8 +1252,34 @@ def page_alerts():
                                 unsafe_allow_html=True,
                             )
 
+                        # ── Cross-org tip (café waste → donate to nonprofit) ──
+                        _cross_scenario = get_cross_org_scenario(item, fc)
+                        if _cross_scenario:
+                            _cross_key = f"cross_{alert.item_id}"
+                            _cross_icon = "🤝" if _cross_scenario == "cafe_donate" else "🥡"
+                            _cross_label = {
+                                "cafe_donate": "Donate surplus to non-profit?",
+                                "nonprofit_expiry": "Redistribute before expiry?",
+                            }.get(_cross_scenario, "Community action")
+                            if st.button(f"{_cross_icon} {_cross_label}",
+                                         key=f"cross_btn_{alert.item_id}_{atype}"):
+                                with st.spinner("Thinking cross-org..."):
+                                    _cross_result = generate_cross_org_tip(item, fc, inv)
+                                    st.session_state.insight_cache[_cross_key] = _cross_result
+                            if _cross_key in st.session_state.insight_cache:
+                                _cr = st.session_state.insight_cache[_cross_key]
+                                if _cr.get("tip"):
+                                    _badge = "llm" if _cr["source"] == "llm" else "fallback"
+                                    st.markdown(
+                                        f'<div class="et-card" style="background:#0f1520;border-color:#2a3a50;margin-top:0.4rem">'
+                                        f'<span class="ai-badge {_badge}">{"AI — Community Tip" if _badge=="llm" else "Community Tip"}</span>'
+                                        f'<div style="margin-top:0.4rem;font-size:0.82rem;line-height:1.6;color:#a8b8b0">{_cr["tip"]}</div>'
+                                        f'</div>',
+                                        unsafe_allow_html=True,
+                                    )
+
                     else:
-                        # OUT OF STOCK / STOCKOUT / CRITICAL_LOW → restock
+                        # Out of stock or stockout risk → restock UI
                         c1, c2 = st.columns(2)
                         with c1:
                             st.markdown(f'<div class="et-mono">Current: {fmt_qty(item["current_qty"], unit)}</div>', unsafe_allow_html=True)
@@ -1197,7 +1318,7 @@ def page_alerts():
                                 st.success(f"✓ Restocked — new qty: {new_total:.1f} {unit}")
                                 st.rerun()
 
-                        # Sustainable supplier suggestion
+                        # ── Sustainable supplier suggestion ──────────────
                         sugg_key = f"sugg_{alert.item_id}"
                         if st.button("🌱 Sustainable sourcing tips",
                                      key=f"sugg_btn_{alert.item_id}_{atype}"):
@@ -1215,534 +1336,7 @@ def page_alerts():
                                 unsafe_allow_html=True,
                             )
 
-        st.divider()
-
-
-
-# PAGE: ANALYTICS
-
-def page_analytics():
-    st.markdown("<h1>Analytics</h1>", unsafe_allow_html=True)
-    st.markdown(
-        '<p class="et-mono" style="color:#6b7c76;margin-top:-0.5rem">'
-        'Usage trends and restock history. Simulate time forward in the sidebar to see depletion.'
-        '</p>',
-        unsafe_allow_html=True,
-    )
-
-    # Item selector
-    _of4 = st.session_state.get("org_filter", "all")
-    _base = inv if _of4 == "all" else [i for i in inv if i["org"] == _of4]
-    trackable = [i for i in _base if i["type"] != "non_expiry"]
-    sel_name  = st.selectbox("Select item", [i["name"] for i in trackable],
-                              label_visibility="collapsed")
-    sel_item  = next(i for i in trackable if i["name"] == sel_name)
-    item_id   = sel_item["id"]
-    unit      = sel_item["unit"]
-
-    item_hist = sorted(
-        [r for r in hist if r["item_id"] == item_id],
-        key=lambda r: r["date"],
-    )
-
-    st.divider()
-
-    if not item_hist:
-        st.info("No usage history for this item yet.")
-        return
-
-    fc           = forecasts.get(item_id, {})
-    dates        = [r["date"] for r in item_hist]
-    usage_vals   = [r["quantity_used"] for r in item_hist]
-    restock_vals = [r.get("restock_qty", 0) for r in item_hist]
-    events       = [r.get("event", "normal") for r in item_hist]
-
-    qty     = sel_item["current_qty"]
-    running = []
-    for usage, restock in zip(reversed(usage_vals), reversed(restock_vals)):
-        qty = qty + usage - restock
-        running.append(round(qty, 2))
-    running = list(reversed(running))
-
-    # Summary metrics
-    total_used     = sum(usage_vals)
-    restock_events = sum(1 for e in events if e == "restock")
-    bulk_events    = sum(1 for e in events if e == "bulk_order")
-    avg_daily      = fc.get("avg_daily_usage", 0)
-    active_days    = sum(1 for v in usage_vals if v > 0)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(f"Total Used ({len(item_hist)}d)", f"{total_used:.1f} {unit}")
-    c2.metric("Avg / Day",       f"{avg_daily:.2f} {unit}")
-    c3.metric("Active Days",     f"{active_days} / {len(item_hist)}")
-    c4.metric("Restock Events",  restock_events)
-    c5.metric("Bulk Spikes",     bulk_events)
-
-    st.divider()
-
-    # Chart: Stock level + daily usage
-    st.markdown("<h2>Stock Level Over Time</h2>", unsafe_allow_html=True)
-
-    restock_indices = [i for i, e in enumerate(events) if e == "restock"]
-    bulk_indices    = [i for i, e in enumerate(events) if e == "bulk_order"]
-
-    chart_html = f"""<!DOCTYPE html><html><head>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-  body {{ margin:0; background:#0f1110; }}
-  .wrap {{ padding:16px; }}
-  canvas {{ max-height:280px; }}
-  .legend {{ display:flex; gap:20px; padding:8px 0 0; font-size:11px; color:#6b7c76;
-             font-family:'DM Mono',monospace; }}
-  .dot {{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; }}
-</style>
-</head><body>
-<div class="wrap">
-  <canvas id="c"></canvas>
-  <div class="legend">
-    <span><span class="dot" style="background:#4ade80"></span>Stock ({unit})</span>
-    <span><span class="dot" style="background:#60a5fa"></span>Daily usage ({unit})</span>
-    <span><span class="dot" style="background:#f97316"></span>Restock</span>
-    <span><span class="dot" style="background:#fcd34d"></span>Bulk spike</span>
-  </div>
-</div>
-<script>
-const labels  = {dates};
-const stock   = {running};
-const usage   = {usage_vals};
-const restock = {restock_vals};
-
-const ptColor = labels.map((_,i) => {{
-  if ({restock_indices}.includes(i)) return '#f97316';
-  if ({bulk_indices}.includes(i))    return '#fcd34d';
-  return 'rgba(0,0,0,0)';
-}});
-const ptSize = labels.map((_,i) =>
-  ({restock_indices}.includes(i) || {bulk_indices}.includes(i)) ? 5 : 0
-);
-
-new Chart(document.getElementById('c'), {{
-  type: 'line',
-  data: {{
-    labels,
-    datasets: [
-      {{
-        label: 'Stock ({unit})',
-        data: stock,
-        borderColor: '#4ade80',
-        backgroundColor: 'rgba(74,222,128,0.07)',
-        borderWidth: 2, fill: true, tension: 0.3,
-        pointBackgroundColor: ptColor,
-        pointRadius: ptSize, pointHoverRadius: 5,
-      }},
-      {{
-        label: 'Daily Usage ({unit})',
-        data: usage,
-        borderColor: '#60a5fa',
-        borderWidth: 1.5, fill: false, tension: 0.3,
-        pointRadius: 0, pointHoverRadius: 4,
-        yAxisID: 'y2',
-      }},
-    ]
-  }},
-  options: {{
-    responsive: true,
-    interaction: {{ mode:'index', intersect:false }},
-    plugins: {{
-      legend: {{ display:false }},
-      tooltip: {{
-        backgroundColor:'#1e2422', borderColor:'#2a3330', borderWidth:1,
-        titleColor:'#e8ede9', bodyColor:'#a8b8b0',
-        callbacks: {{
-          afterBody: (items) => {{
-            const i = items[0].dataIndex;
-            const out = [];
-            if ({restock_indices}.includes(i)) out.push(`↑ Restock: +${{restock[i]}} {unit}`);
-            if ({bulk_indices}.includes(i))    out.push('⚡ Bulk spike');
-            return out;
-          }}
-        }}
-      }}
-    }},
-    scales: {{
-      x:  {{ ticks:{{ color:'#6b7c76', maxTicksLimit:10, font:{{size:10}} }}, grid:{{color:'#1e2422'}} }},
-      y:  {{ position:'left',  ticks:{{color:'#4ade80',font:{{size:10}}}}, grid:{{color:'#1e2422'}},
-             title:{{display:true,text:'Stock ({unit})',color:'#6b7c76',font:{{size:10}}}} }},
-      y2: {{ position:'right', ticks:{{color:'#60a5fa',font:{{size:10}}}}, grid:{{drawOnChartArea:false}},
-             title:{{display:true,text:'Usage ({unit})',color:'#6b7c76',font:{{size:10}}}} }},
-    }}
-  }}
-}});
-</script></body></html>"""
-
-    st.components.v1.html(chart_html, height=340)
-    st.divider()
-
-    # Usage bar chart + restock log
-    col_l, col_r = st.columns([3, 2])
-
-    with col_l:
-        st.markdown("<h2>Daily Usage — Last 21 Days</h2>", unsafe_allow_html=True)
-        recent_dates  = dates[-21:]
-        recent_usage  = usage_vals[-21:]
-        recent_events = events[-21:]
-        bar_colors    = ['#f97316' if e=='restock' else '#fcd34d' if e=='bulk_order'
-                         else '#4ade80' for e in recent_events]
-
-        bar_html = f"""<!DOCTYPE html><html><head>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>body{{margin:0;background:#0f1110;}} canvas{{max-height:220px;}}</style>
-</head><body>
-<div style="padding:12px">
-  <canvas id="b"></canvas>
-</div>
-<script>
-new Chart(document.getElementById('b'), {{
-  type: 'bar',
-  data: {{
-    labels: {recent_dates},
-    datasets: [{{ label:'Usage ({unit})', data:{recent_usage},
-                 backgroundColor:{bar_colors}, borderRadius:2 }}]
-  }},
-  options: {{
-    responsive:true,
-    plugins:{{ legend:{{display:false}},
-      tooltip:{{backgroundColor:'#1e2422',borderColor:'#2a3330',borderWidth:1,
-                titleColor:'#e8ede9',bodyColor:'#a8b8b0'}} }},
-    scales:{{
-      x:{{ ticks:{{color:'#6b7c76',maxTicksLimit:7,font:{{size:9}}}}, grid:{{color:'#1e2422'}} }},
-      y:{{ ticks:{{color:'#a8b8b0',font:{{size:10}}}}, grid:{{color:'#1e2422'}} }}
-    }}
-  }}
-}});
-</script></body></html>"""
-        st.components.v1.html(bar_html, height=260)
-
-    with col_r:
-        st.markdown("<h2>Restock Log</h2>", unsafe_allow_html=True)
-        restock_records = [
-            (r["date"], r["restock_qty"])
-            for r in item_hist if r.get("restock_qty", 0) > 0
-        ]
-        if restock_records:
-            for date, qty_r in reversed(restock_records[-10:]):
-                st.markdown(
-                    f'<div class="et-card" style="padding:0.5rem 0.8rem;margin-bottom:0.3rem;'
-                    f'display:flex;justify-content:space-between;align-items:center">'
-                    f'<span class="et-mono" style="font-size:0.75rem;color:#6b7c76">{date}</span>'
-                    f'<span style="color:#f97316;font-family:Syne,sans-serif;font-size:0.85rem;'
-                    f'font-weight:600">+{qty_r:.0f} {unit}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.caption("No restock events recorded yet.")
-
-    st.divider()
-
-    # Weekly breakdown table
-    st.markdown("<h2>Weekly Breakdown</h2>", unsafe_allow_html=True)
-    from datetime import datetime as _dt
-    weekly = {}
-    for r in item_hist:
-        w = _dt.strptime(r["date"], "%Y-%m-%d").isocalendar()[1]
-        d = weekly.setdefault(w, {"used": 0, "restocked": 0, "active": 0})
-        d["used"]      += r["quantity_used"]
-        d["restocked"] += r.get("restock_qty", 0)
-        if r["quantity_used"] > 0:
-            d["active"] += 1
-
-    rows = ""
-    for n, (w, d) in enumerate(sorted(weekly.items()), 1):
-        avg = d["used"] / max(d["active"], 1)
-        rows += (
-            f'<tr><td>Week {n}</td>'
-            f'<td style="color:#4ade80">{d["used"]:.1f} {unit}</td>'
-            f'<td style="color:#60a5fa">{avg:.2f} {unit}/day</td>'
-            f'<td style="color:#f97316">{d["restocked"]:.0f} {unit}</td>'
-            f'<td style="color:#a8b8b0">{d["active"]} days</td></tr>'
-        )
-
-    st.markdown(
-        f'<style>table{{width:100%;border-collapse:collapse;font-family:DM Mono,monospace;font-size:0.8rem}}'
-        f'th{{color:#6b7c76;text-transform:uppercase;letter-spacing:.08em;font-size:.68rem;'
-        f'padding:.4rem .8rem;border-bottom:1px solid #2a3330;text-align:left}}'
-        f'td{{color:#e8ede9;padding:.4rem .8rem;border-bottom:1px solid #1e2422}}'
-        f'tr:last-child td{{border-bottom:none}}</style>'
-        f'<table><thead><tr><th>Period</th><th>Total Used</th><th>Daily Avg</th>'
-        f'<th>Restocked</th><th>Active Days</th></tr></thead>'
-        f'<tbody>{rows}</tbody></table>',
-        unsafe_allow_html=True,
-    )
-
-
-# PAGE: ADD ITEM
-
-def page_add_item():
-    st.markdown("<h1>Add New Item</h1>", unsafe_allow_html=True)
-    st.caption("All fields marked * are required.")
-    st.divider()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        name     = st.text_input("Item Name *", placeholder="e.g. Whole Milk")
-        org      = st.selectbox("Organisation *", options=list(VALID_ORGS),
-                                format_func=lambda x: ORG_LABELS.get(x, x))
-        item_type = st.selectbox("Item Type *", options=list(VALID_TYPES),
-                                 format_func=lambda x: TYPE_LABELS.get(x, x))
-        category = st.text_input("Category", placeholder="e.g. dairy, reagent, office_supply")
-        unit     = st.text_input("Unit *", placeholder="e.g. liters, kg, units, boxes")
-
-    with col2:
-        current_qty     = st.number_input("Current Quantity *", min_value=0.0, step=1.0, value=10.0)
-        reorder_threshold = st.number_input("Reorder Threshold *", min_value=0.0, step=1.0, value=3.0,
-                                             help="Alert triggers below this quantity")
-        reorder_qty     = st.number_input("Reorder Quantity", min_value=0.0, step=1.0, value=0.0,
-                                          help="How much to order. Defaults to 3× threshold.")
-        cost_per_unit   = st.number_input("Cost per Unit (₹)", min_value=0.0, step=1.0, value=0.0)
-
-        has_expiry = st.checkbox("Has expiry date?", value=(item_type == "perishable"))
-        expiry_date = None
-        if has_expiry:
-            expiry_date = st.date_input("Expiry Date",
-                                        value=datetime.today() + timedelta(days=30),
-                                        min_value=datetime.today())
-            expiry_date = expiry_date.strftime("%Y-%m-%d")
-
-    st.divider()
-
-    if st.button("＋ Add Item", type="primary"):
-        data = {
-            "name": name,
-            "org": org,
-            "type": item_type,
-            "category": category or "general",
-            "unit": unit,
-            "current_qty": current_qty,
-            "reorder_threshold": reorder_threshold,
-            "reorder_qty": reorder_qty if reorder_qty > 0 else reorder_threshold * 3,
-            "cost_per_unit": cost_per_unit,
-            "expiry_date": expiry_date,
-        }
-        updated_inv, errors = add_item(inv, data)
-        if errors:
-            for e in errors:
-                st.error(f"✗ {e}")
-        else:
-            st.session_state.inventory = updated_inv
-            get_forecasts.clear()
-            st.success(f"✓ '{name}' added to inventory.")
-            st.balloons()
-            st.session_state.page = "inventory"
-            st.rerun()
-
-
-# PAGE: ALERTS
-
-def page_alerts():
-    st.markdown("<h1>Alerts</h1>", unsafe_allow_html=True)
-
-    _of3 = st.session_state.get("org_filter", "all")
-    disp_inv = inv if _of3 == "all" else [i for i in inv if i["org"] == _of3]
-    disp_fc  = {i["id"]: forecasts.get(i["id"], {}) for i in disp_inv}
-    disp_als = check_all_alerts(disp_inv, disp_fc)
-
-    # Summary row
-    by_sev = {s: [a for a in disp_als if a.severity == s] for s in Severity}
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🚨 High",   len(by_sev[Severity.HIGH]))
-    c2.metric("⚠️ Medium", len(by_sev[Severity.MEDIUM]))
-    c3.metric("🔍 Low",    len(by_sev[Severity.LOW]))
-
-    st.divider()
-
-    if not disp_als:
-        st.success("No alerts for the selected filter. Inventory looks healthy.")
-        return
-
-    type_groups = {}
-    for alert in disp_als:
-        type_groups.setdefault(alert.type, []).append(alert)
-
-    type_order = [AlertType.EXPIRED, AlertType.WASTE_RISK, AlertType.STOCKOUT_RISK,
-                  AlertType.CRITICAL_LOW]
-
-    for atype in type_order:
-        group = type_groups.get(atype, [])
-        if not group:
-            continue
-
-        emoji = alert_emoji(atype)
-        label = atype.value.replace("_", " ").title()
-        st.markdown(f"<h2>{emoji} {label} ({len(group)})</h2>", unsafe_allow_html=True)
-
-        for alert in group:
-            css = sev_class(alert.severity)
-            item = get_item(inv, alert.item_id)
-            fc   = forecasts.get(alert.item_id, {})
-
-            with st.expander(f"{alert.item_name} — {alert.title}"):
-                st.markdown(
-                    f'<div class="et-card {css}">'
-                    f'<div style="font-size:0.85rem;line-height:1.6">{alert.message}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                if item:
-                    avg_usage  = fc.get("avg_daily_usage", 0)
-                    days_out   = fc.get("days_until_runout")
-                    exp_days   = fc.get("expiry_days_remaining")
-                    unit       = item["unit"]
-
-                    # Restock suggestion (usage-based)
-                    shelf_life = item.get("shelf_life_days")
-                    if item["type"] == "perishable" and shelf_life:
-                        TARGET_DAYS_STOCK = min(14, shelf_life - 1)
-                        target_label = f"~{TARGET_DAYS_STOCK}d (shelf life)"
-                    else:
-                        TARGET_DAYS_STOCK = 14
-                        target_label = "~14d"
-                    if avg_usage and avg_usage > 0:
-                        target_qty    = round(avg_usage * TARGET_DAYS_STOCK, 1)
-                        on_hand       = item["current_qty"]
-                        suggested_order = round(max(0, target_qty - on_hand), 1)
-                        restock_note = (
-                            f"Target stock: {target_qty} {unit} ({target_label}). "
-                            f"You have {on_hand:.1f} {unit} — order {suggested_order} {unit}."
-                        )
-                    else:
-                        suggested_order = float(item.get("reorder_qty", 0))
-                        restock_note = None
-
-                    # Routing: discard only if stock remains AND expired/waste
-                    already_out   = item["current_qty"] <= 0
-                    is_expired    = (exp_days is not None and exp_days <= 0)
-                    is_waste_risk = atype == AlertType.WASTE_RISK
-                    show_discard  = (is_expired or is_waste_risk) and not already_out
-
-                    if show_discard:
-                        waste_qty = item["current_qty"]
-                        st.markdown(
-                            f'<div class="et-card alert-high" style="margin-top:0.5rem">'
-                            f'<div style="font-size:0.82rem;color:#f87171;margin-bottom:0.5rem">'
-                            f'🚫 {waste_qty:.1f} {unit} will be discarded. This cannot be undone.</div>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-                        col_d, col_r = st.columns(2)
-                        with col_d:
-                            if st.button(f"🗑 Discard all ({waste_qty:.0f} {unit})",
-                                         key=f"discard_{alert.item_id}_{atype}", type="primary"):
-                                _sim_date = st.session_state.get("sim_current_date")
-                                updated_inv, updated_hist, errors = update_quantity(
-                                    inv, hist, alert.item_id, 0.0, "waste",
-                                    current_date=_sim_date,
-                                )
-                                if errors:
-                                    for e in errors: st.error(e)
-                                else:
-                                    st.session_state.inventory = updated_inv
-                                    st.session_state.history   = updated_hist
-                                    get_forecasts.clear()
-                                    st.session_state.insight_cache = {}
-                                    st.success(f"✓ Discarded {waste_qty:.0f} {unit} of {item['name']}")
-                                    st.rerun()
-                        with col_r:
-                            st.markdown(
-                                f'<div class="et-card" style="padding:0.6rem 0.8rem">'
-                                f'<div class="et-label">Suggested Restock (after discarding)</div>'
-                                f'<div style="color:#4ade80;font-size:1rem;font-weight:700;font-family:Syne,sans-serif">{suggested_order} {unit}</div>'
-                                + (f'<div class="et-mono" style="font-size:0.72rem;margin-top:0.2rem">{restock_note}</div>' if restock_note else "")
-                                + f'</div>',
-                                unsafe_allow_html=True,
-                            )
-
-                        # Cross-org tip (café waste → donate to nonprofit)
-                        _cross_scenario = get_cross_org_scenario(item, fc)
-                        if _cross_scenario:
-                            _cross_key = f"cross_{alert.item_id}"
-                            _cross_icon = "🤝" if _cross_scenario == "cafe_donate" else "🥡"
-                            _cross_label = {
-                                "cafe_donate": "Donate surplus to non-profit?",
-                                "nonprofit_expiry": "Redistribute before expiry?",
-                            }.get(_cross_scenario, "Community action")
-                            if st.button(f"{_cross_icon} {_cross_label}",
-                                         key=f"cross_btn_{alert.item_id}_{atype}"):
-                                with st.spinner("Thinking cross-org..."):
-                                    _cross_result = generate_cross_org_tip(item, fc, inv)
-                                    st.session_state.insight_cache[_cross_key] = _cross_result
-                            if _cross_key in st.session_state.insight_cache:
-                                _cr = st.session_state.insight_cache[_cross_key]
-                                if _cr.get("tip"):
-                                    _badge = "llm" if _cr["source"] == "llm" else "fallback"
-                                    st.markdown(
-                                        f'<div class="et-card" style="background:#0f1520;border-color:#2a3a50;margin-top:0.4rem">'
-                                        f'<span class="ai-badge {_badge}">{"AI — Community Tip" if _badge=="llm" else "Community Tip"}</span>'
-                                        f'<div style="margin-top:0.4rem;font-size:0.82rem;line-height:1.6;color:#a8b8b0">{_cr["tip"]}</div>'
-                                        f'</div>',
-                                        unsafe_allow_html=True,
-                                    )
-
-                    else:
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.markdown(f'<div class="et-mono">Current: {fmt_qty(item["current_qty"], unit)}</div>', unsafe_allow_html=True)
-                            if days_out is not None and days_out > 0:
-                                st.markdown(f'<div class="et-mono">Runs out in: {days_out:.1f} days</div>', unsafe_allow_html=True)
-                            if exp_days is not None and exp_days > 0:
-                                st.markdown(f'<div class="et-mono">Expires in: {exp_days} days</div>', unsafe_allow_html=True)
-                        with c2:
-                            st.markdown(
-                                f'<div class="et-card" style="padding:0.6rem 0.8rem">'
-                                f'<div class="et-label">Suggested Restock</div>'
-                                f'<div style="color:#4ade80;font-size:1rem;font-weight:700;font-family:Syne,sans-serif">{suggested_order} {unit}</div>'
-                                + (f'<div class="et-mono" style="font-size:0.72rem;margin-top:0.2rem">{restock_note}</div>' if restock_note else "")
-                                + f'</div>',
-                                unsafe_allow_html=True,
-                            )
-                        restock_qty = st.number_input(
-                            "Restock amount", value=float(suggested_order),
-                            min_value=0.0, step=1.0, key=f"alt_qty_{alert.item_id}_{atype}"
-                        )
-                        new_total = item["current_qty"] + restock_qty
-                        if st.button(f"+ Restock {restock_qty:.0f} {unit}",
-                                     key=f"alt_upd_{alert.item_id}_{atype}", type="primary"):
-                            _sim_date = st.session_state.get("sim_current_date")
-                            updated_inv, updated_hist, errors = update_quantity(
-                                inv, hist, alert.item_id, new_total, "restock",
-                                current_date=_sim_date,
-                            )
-                            if errors:
-                                for e in errors: st.error(e)
-                            else:
-                                st.session_state.inventory = updated_inv
-                                st.session_state.history   = updated_hist
-                                get_forecasts.clear()
-                                st.session_state.insight_cache = {}
-                                st.success(f"Restocked — new qty: {new_total:.1f} {unit}")
-                                st.rerun()
-
-                        # Sustainable supplier suggestion
-                        sugg_key = f"sugg_{alert.item_id}"
-                        if st.button("🌱 Sustainable sourcing tips",
-                                     key=f"sugg_btn_{alert.item_id}_{atype}"):
-                            with st.spinner("Finding sustainable options..."):
-                                sugg = suggest_suppliers(item)
-                                st.session_state.insight_cache[sugg_key] = sugg
-                        if sugg_key in st.session_state.insight_cache:
-                            _sugg = st.session_state.insight_cache[sugg_key]
-                            _badge = "llm" if _sugg["source"] == "llm" else "fallback"
-                            st.markdown(
-                                f'<div class="et-card" style="background:#0f1a14;border-color:#2a4a32;margin-top:0.4rem">'
-                                f'<span class="ai-badge {_badge}">{"AI Suggestion" if _badge=="llm" else "Fallback Tip"}</span>'
-                                f'<div style="margin-top:0.4rem;font-size:0.82rem;line-height:1.6;color:#a8b8b0">{_sugg["suggestion"]}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
-
-                        # Cross-org tip (nonprofit stockout → solicit donations)
+                        # ── Cross-org tip (nonprofit stockout → solicit donations) ──
                         _cross_scenario = get_cross_org_scenario(item, fc)
                         if _cross_scenario == "nonprofit_solicit":
                             _cross_key = f"cross_{alert.item_id}"
@@ -1767,7 +1361,9 @@ def page_alerts():
 
 
 
+# ─────────────────────────────────────────────
 # PAGE: ANALYTICS
+# ─────────────────────────────────────────────
 
 def page_analytics():
     from datetime import datetime as _dt
@@ -1790,7 +1386,7 @@ def page_analytics():
             unsafe_allow_html=True,
         )
 
-    #Item selector (filtered by selected org)
+    # ── Item selector (filtered by selected org) ──────────────────────────────
     _org_filter = st.session_state.get("org_filter", "all")
     if _org_filter == "all":
         trackable = [i for i in inv if i["type"] != "non_expiry"]
@@ -1817,7 +1413,7 @@ def page_analytics():
         st.info("No usage history for this item yet.")
         return
 
-    # Split historical vs simulated
+    # ── Split historical vs simulated ─────────────────────────────────────────
     fc = forecasts.get(item_id, {})
     hist_records = [r for r in item_hist if r.get("event") != "simulated"]
     sim_records  = [r for r in item_hist if r.get("event") == "simulated"]
@@ -1827,8 +1423,10 @@ def page_analytics():
     restock_vals  = [r.get("restock_qty", 0) for r in item_hist]
     events        = [r.get("event", "normal") for r in item_hist]
 
+    # Index where simulation starts (for chart shading)
     sim_start_index = len(hist_records) if sim_records else None
 
+    # Rebuild running qty backwards from current
     current = sel_item["current_qty"]
     running = []
     qty = current
@@ -1837,7 +1435,7 @@ def page_analytics():
         running.append(round(qty, 2))
     running = list(reversed(running))
 
-    # Summary metrics row
+    # ── Summary metrics row ───────────────────────────────────────────────────
     total_used    = sum(usage_vals)
     total_restock = sum(restock_vals)
     restock_events = sum(1 for e in events if e == "restock")
@@ -1855,12 +1453,13 @@ def page_analytics():
 
     st.divider()
 
-    # Chart 1: Stock level over time (area)
+    # ── Chart 1: Stock level over time (area) ─────────────────────────────────
     chart_title = "Stock Level Over Time"
     if sim_active and sim_start_index:
         chart_title += f" (grey = simulated {sim_d}d)"
     st.markdown(f"<h2>{chart_title}</h2>", unsafe_allow_html=True)
 
+    # Build HTML canvas chart (Chart.js via CDN)
     labels_js    = str(dates)
     running_js   = str(running)
     usage_js     = str(usage_vals)
@@ -1868,6 +1467,7 @@ def page_analytics():
     threshold_js = str(sel_item["reorder_threshold"])
     unit         = sel_item["unit"]
 
+    # Mark restock days for annotations
     restock_indices = [i for i, e in enumerate(events) if e == "restock"]
     bulk_indices    = [i for i, e in enumerate(events) if e == "bulk_order"]
     sim_start_js    = sim_start_index if sim_start_index is not None else len(dates)
@@ -1996,12 +1596,13 @@ new Chart(ctx, {{
 
     st.divider()
 
-    # Chart 2: Usage distribution (bar) + restock timeline
+    # ── Chart 2: Usage distribution (bar) + restock timeline ─────────────────
     col_l, col_r = st.columns([3, 2])
 
     with col_l:
         st.markdown("<h2>Daily Usage Distribution</h2>", unsafe_allow_html=True)
 
+        # Simple bar chart: last 21 days of usage
         recent_dates  = dates[-21:]
         recent_usage  = usage_vals[-21:]
         recent_events = events[-21:]
@@ -2068,7 +1669,7 @@ new Chart(document.getElementById('barChart'), {{
 
     st.divider()
 
-    # Consumption stats table
+    # ── Consumption stats table ───────────────────────────────────────────────
     st.markdown("<h2>Consumption Breakdown</h2>", unsafe_allow_html=True)
 
     # Weekly buckets
@@ -2116,7 +1717,9 @@ tr:last-child td {{ border-bottom: none; }}
     st.markdown(table_html, unsafe_allow_html=True)
 
 
+# ─────────────────────────────────────────────
 # ROUTER
+# ─────────────────────────────────────────────
 
 page = st.session_state.page
 

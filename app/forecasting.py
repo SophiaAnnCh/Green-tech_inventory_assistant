@@ -1,3 +1,4 @@
+# pyright: reportArgumentType=false
 from datetime import datetime, timedelta
 
 _SIM_CURRENT_DATE: str | None = None

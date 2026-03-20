@@ -26,7 +26,6 @@ cd ecotrack
 
 pip install -r requirements.txt
 
-cp .env.example .env
 # Add your key to .env:  GROQ_API_KEY=your_key_here
 
 python data/generate_synthetic_data.py   # creates inventory.json + usage_history.json

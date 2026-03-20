@@ -8,7 +8,7 @@
 
 **Estimated Time Spent:** ~8 hours across design, implementation, debugging, and testing
 
-**Video Walkthrough:** *(add YouTube/Vimeo link here)*
+**Video Walkthrough:** *https://youtu.be/CEPTLfCGTTo*
 
 ---
 

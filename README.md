@@ -36,7 +36,7 @@ streamlit run app/main.py
 
 ```bash
 python tests/test_ecotrack.py
-# Expected: Results: 31 passed, 0 failed
+# Expected: Results: 39 passed, 0 failed
 ```
 
 No pytest required. Plain Python, zero test dependencies.

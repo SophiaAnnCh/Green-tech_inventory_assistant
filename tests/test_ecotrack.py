@@ -418,6 +418,158 @@ def test_fallback_flags_waste_risk():
     assert "waste" in result.lower(), f"Expected 'waste' in fallback output, got: {result}"
 
 
+
+# ─────────────────────────────────────────────
+# LIVE MODE DATE VALIDATION & GAP FILL
+# ─────────────────────────────────────────────
+
+def _simulate_live_mode_save(ref_date_str, record_date_str, item, existing_hist):
+    """
+    Replicates the Live Mode save logic from main.py in a pure-Python context
+    so it can be tested without Streamlit.
+
+    Returns (gap_entries, final_hist, days_delta, date_blocked).
+    """
+    from datetime import datetime as dt, timedelta as td
+
+    ref_date    = dt.strptime(ref_date_str, "%Y-%m-%d").date()
+    record_date = dt.strptime(record_date_str, "%Y-%m-%d").date()
+    days_delta  = (record_date - ref_date).days
+
+    if days_delta < 0:
+        return [], existing_hist, days_delta, True  # blocked
+
+    gap_entries = []
+    cur_hist    = list(existing_hist)
+
+    if days_delta > 0:
+        for gap_day in range(1, days_delta):
+            gap_date = (ref_date + td(days=gap_day)).strftime("%Y-%m-%d")
+            entry = {
+                "item_id":       item["id"],
+                "date":          gap_date,
+                "quantity_used": 0.0,
+                "restock_qty":   0,
+                "event":         "no_use",
+            }
+            gap_entries.append(entry)
+            cur_hist.append(entry)
+
+    return gap_entries, cur_hist, days_delta, False
+
+
+def test_past_date_is_blocked():
+    """Saving for a date before the reference date must be blocked."""
+    item = make_item()
+    _, _, days_delta, blocked = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-18",   # 2 days in the past
+        item=item,
+        existing_hist=[],
+    )
+    assert blocked is True, "Expected save to be blocked for a past date"
+    assert days_delta < 0
+
+
+def test_today_is_not_blocked():
+    """Saving for the reference date itself (today) must not be blocked."""
+    item = make_item()
+    _, _, days_delta, blocked = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-20",   # same day
+        item=item,
+        existing_hist=[],
+    )
+    assert blocked is False
+    assert days_delta == 0
+
+
+def test_future_date_not_blocked():
+    """Saving for a future date must not be blocked."""
+    item = make_item()
+    _, _, days_delta, blocked = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-25",   # 5 days ahead
+        item=item,
+        existing_hist=[],
+    )
+    assert blocked is False
+    assert days_delta == 5
+
+
+def test_future_date_gap_fill_count():
+    """Gap between ref date and future record date should produce (delta - 1) no-use entries."""
+    item = make_item()
+    gap_entries, _, days_delta, _ = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-25",   # 5 days ahead → 4 gap days (21, 22, 23, 24)
+        item=item,
+        existing_hist=[],
+    )
+    assert days_delta == 5
+    assert len(gap_entries) == 4, f"Expected 4 gap entries, got {len(gap_entries)}"
+
+
+def test_future_date_gap_fill_events():
+    """All gap-fill entries must have event='no_use' and quantity_used=0."""
+    item = make_item()
+    gap_entries, _, _, _ = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-23",   # 3 days ahead → 2 gap days
+        item=item,
+        existing_hist=[],
+    )
+    for entry in gap_entries:
+        assert entry["event"] == "no_use", f"Expected no_use, got {entry['event']}"
+        assert entry["quantity_used"] == 0.0, f"Expected 0.0 usage, got {entry['quantity_used']}"
+        assert entry["item_id"] == item["id"]
+
+
+def test_future_date_gap_fill_dates_are_correct():
+    """Gap entries must cover exactly the days between ref and record date (exclusive of both)."""
+    item = make_item()
+    gap_entries, _, _, _ = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-23",   # gap days should be 21 and 22
+        item=item,
+        existing_hist=[],
+    )
+    gap_dates = [e["date"] for e in gap_entries]
+    assert gap_dates == ["2026-03-21", "2026-03-22"],         f"Expected ['2026-03-21', '2026-03-22'], got {gap_dates}"
+
+
+def test_gap_fill_zero_use_excluded_from_forecast():
+    """No-use gap entries (quantity_used=0) must not affect the WMA average."""
+    item = make_item(current_qty=10.0)
+
+    # Base history: 2.0/day for 15 days
+    base_hist = make_history("test_001", [2.0] * 15)
+    result_before = forecast_item(item, base_hist)
+
+    # Add 5 no-use gap entries on top
+    gap_hist = base_hist + [
+        {"item_id": "test_001", "date": f"2026-03-2{i}", "quantity_used": 0.0,
+         "restock_qty": 0, "event": "no_use"}
+        for i in range(1, 6)
+    ]
+    result_after = forecast_item(item, gap_hist)
+
+    assert approx(result_after["avg_daily_usage"], result_before["avg_daily_usage"], rel=0.05),         f"Gap-fill entries should not change avg: before={result_before['avg_daily_usage']:.3f}, after={result_after['avg_daily_usage']:.3f}"
+
+
+def test_same_day_produces_no_gap_entries():
+    """Recording for today (delta=0) must produce zero gap entries."""
+    item = make_item()
+    gap_entries, _, days_delta, _ = _simulate_live_mode_save(
+        ref_date_str="2026-03-20",
+        record_date_str="2026-03-20",
+        item=item,
+        existing_hist=[],
+    )
+    assert days_delta == 0
+    assert len(gap_entries) == 0
+
+
 # ─────────────────────────────────────────────
 # RUNNER
 # ─────────────────────────────────────────────
@@ -460,6 +612,15 @@ ALL_TESTS = [
     # Fallback insight
     ("Fallback runs without API key",      test_fallback_runs_without_api_key),
     ("Fallback flags waste risk",          test_fallback_flags_waste_risk),
+    # Live Mode date validation & gap fill
+    ("Past date is blocked",               test_past_date_is_blocked),
+    ("Today is not blocked",               test_today_is_not_blocked),
+    ("Future date not blocked",            test_future_date_not_blocked),
+    ("Future date gap fill count",         test_future_date_gap_fill_count),
+    ("Future date gap fill events",        test_future_date_gap_fill_events),
+    ("Future date gap fill dates correct", test_future_date_gap_fill_dates_are_correct),
+    ("Gap fill excluded from forecast",    test_gap_fill_zero_use_excluded_from_forecast),
+    ("Same day — no gap entries",          test_same_day_produces_no_gap_entries),
 ]
 
 if __name__ == "__main__":
